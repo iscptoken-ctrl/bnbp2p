@@ -217,7 +217,14 @@ ul{padding-left:18px;margin:6px 0}
 <script>
 // ===================== CONFIG =====================
 const CONTRACT = "0x16cb1F38EAB1ACe7dF8dF2808e86D04C51b26EaA"; // BnbP2P on BNB Chain
-const RPC = "https://bsc-dataseed.bnbchain.org";
+const RPCS = [
+  "https://bsc-dataseed.bnbchain.org",
+  "https://bsc-dataseed1.defibit.io",
+  "https://bsc-rpc.publicnode.com",
+  "https://bsc.drpc.org",
+  "https://bsc-dataseed1.ninicoin.io",
+];
+let RPC = RPCS[0];
 const CHAIN_ID = 56;
 const EXPLORER = "https://bscscan.com";
 const NATIVE = "0x0000000000000000000000000000000000000000";
@@ -305,7 +312,27 @@ const PAIR_ABI = ["function getReserves() view returns (uint112,uint112,uint32)"
 
 // ===================== STATE =====================
 const E = ethers;
-const ro = new E.JsonRpcProvider(RPC, CHAIN_ID, { staticNetwork: true });
+const makeProvider = url => new E.JsonRpcProvider(url, CHAIN_ID, { staticNetwork: E.Network.from(CHAIN_ID), batchMaxCount: 1 });
+let ro = makeProvider(RPC);
+// Pick the first public RPC that answers (they often limit browsers).
+async function pickRpc() {
+  for (const url of RPCS) {
+    try {
+      const p = makeProvider(url);
+      const n = await Promise.race([p.getBlockNumber(), new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 4000))]);
+      if (n > 0) { RPC = url; ro = p; return; }
+    } catch (e) { console.warn("RPC failed", url, e?.message); }
+  }
+}
+// Run async jobs a few at a time so public RPCs don't rate-limit us.
+async function mapLimit(items, limit, fn) {
+  const out = []; let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const k = i++; out[k] = await fn(items[k]); }
+  });
+  await Promise.all(workers);
+  return out;
+}
 let signer = null, account = null;
 let orders = [];
 const price = {};            // addrLower -> { usd, liqUsd }
@@ -335,9 +362,9 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;"
 
 // ===================== TOKENS =====================
 async function refreshDecimals() {
-  await Promise.all(TOKENS.filter(t => t.addr !== NATIVE).map(async t => {
+  await mapLimit(TOKENS.filter(t => t.addr !== NATIVE), 4, async t => {
     try { t.dec = Number(await new E.Contract(t.addr, ERC20_ABI, ro).decimals()); } catch {}
-  }));
+  });
 }
 
 async function loadCommunityTokens() {
@@ -347,7 +374,7 @@ async function loadCommunityTokens() {
     const list = await c.allowedTokens();
     try { listingFee = await c.LISTING_FEE(); } catch {}
     const fresh = list.filter(a => !byAddr[a.toLowerCase()]);
-    await Promise.all(fresh.map(async a => {
+    await mapLimit(fresh, 3, async a => {
       const ec = new E.Contract(a, ERC20_ABI, ro);
       let sym = short(a), name = "Community token", dec = 18;
       try { sym = (await ec.symbol()).slice(0, 12); } catch {}
@@ -355,7 +382,7 @@ async function loadCommunityTokens() {
       try { dec = Number(await ec.decimals()); } catch {}
       const t = { sym: esc(sym), addr: a, dec, name: esc(name), core: false };
       TOKENS.push(t); byAddr[a.toLowerCase()] = t;
-    }));
+    });
     if (fresh.length) fillSelects();
   } catch (e) { console.error(e); }
 }
@@ -385,14 +412,14 @@ async function priceToken(t) {
       const ta = Number(E.formatUnits(p.ra, dec)), tb = Number(E.formatUnits(p.rb, 18));
       out.push({ usd: tb / ta * bnbUsd, liqUsd: 2 * tb * bnbUsd });
     }
-  } catch {}
+  } catch (e) { console.warn("price", t.sym, e?.message); }
   try {
     const p = await readPair(t.addr, USDT);
     if (p && p.ra > 0n) {
       const ta = Number(E.formatUnits(p.ra, dec)), tb = Number(E.formatUnits(p.rb, 18));
       out.push({ usd: tb / ta, liqUsd: 2 * tb });
     }
-  } catch {}
+  } catch (e) { console.warn("price", t.sym, e?.message); }
   out.sort((x, y) => y.liqUsd - x.liqUsd);
   return out[0] || { usd: null, liqUsd: 0 };
 }
@@ -400,23 +427,24 @@ async function priceToken(t) {
 async function loadPrices() {
   try {
     const p = await readPair(WBNB, USDT);
-    bnbUsd = p ? Number(E.formatUnits(p.rb, 18)) / Number(E.formatUnits(p.ra, 18)) : 0;
+    if (!p) throw new Error("WBNB/USDT pool not readable");
+    bnbUsd = Number(E.formatUnits(p.rb, 18)) / Number(E.formatUnits(p.ra, 18));
     price[NATIVE] = { usd: bnbUsd, liqUsd: Infinity };
     price[USDT.toLowerCase()] = { usd: 1, liqUsd: Infinity };
-    await Promise.all(TOKENS.filter(t => t.addr !== NATIVE && t.addr.toLowerCase() !== USDT.toLowerCase())
-      .map(async t => { price[t.addr.toLowerCase()] = await priceToken(t); }));
+    await mapLimit(TOKENS.filter(t => t.addr !== NATIVE && t.addr.toLowerCase() !== USDT.toLowerCase()), 4,
+      async t => { price[t.addr.toLowerCase()] = await priceToken(t); });
     $("nativePrice").textContent = "BNB " + (bnbUsd ? "$" + fmt(bnbUsd, 2) : "—");
     renderPrices(); renderOrders(); renderMine(); updatePreview();
   } catch (e) {
     console.error(e);
-    $("priceTime").textContent = "Price source unreachable. Orders still work; prices are only for display.";
+    $("priceTime").textContent = "Price source unreachable (" + (e?.shortMessage || e?.message || e) + "). Orders still work; prices are only for display.";
   }
 }
 
 function renderPrices() {
   $("priceTable").innerHTML = visibleTokens().map(t => {
     const p = price[t.addr.toLowerCase()] || {};
-    const thin = t.addr !== NATIVE && t.addr.toLowerCase() !== USDT.toLowerCase() && (p.liqUsd ?? 0) < THIN_USD;
+    const thin = p.usd && t.addr !== NATIVE && t.addr.toLowerCase() !== USDT.toLowerCase() && (p.liqUsd ?? 0) < THIN_USD;
     return `<tr>
       <td>${tokBadge(t)}${commTag(t)} ${thin ? '<span class="tag thin">thin</span>' : ""}<div class="small muted">${t.name}</div></td>
       <td class="r">${p.usd ? "$" + fmt(p.usd, 6) : "—"}</td>
@@ -455,7 +483,7 @@ function orderRow(o) {
   const st = tokOf(o.sellToken), bt = tokOf(o.buyToken);
   const sa = units(o.sellAmount, st), ba = units(o.buyAmount, bt);
   const d = dealPct(o);
-  const thin = [o.sellToken, o.buyToken].some(a => a !== NATIVE && a.toLowerCase() !== USDT.toLowerCase() && (price[a.toLowerCase()]?.liqUsd ?? 0) < THIN_USD);
+  const thin = [o.sellToken, o.buyToken].some(a => { const p = price[a.toLowerCase()]; return p?.usd && a !== NATIVE && a.toLowerCase() !== USDT.toLowerCase() && (p.liqUsd ?? 0) < THIN_USD; });
   const comm = !st.core || !bt.core;
   const dealTxt = d === null ? "no market price"
     : `<span class="${d >= 0 ? "good" : "bad"}">${d >= 0 ? "+" : ""}${d.toFixed(2)}%</span> vs market`;
@@ -737,6 +765,7 @@ $("contractInfo").innerHTML = CONTRACT
 if (!CONTRACT) $("notDeployed").classList.remove("hidden");
 
 (async () => {
+  await pickRpc();
   await refreshDecimals();
   await loadCommunityTokens();
   $("lFeeTxt").textContent = E.formatUnits(listingFee, tokOf(CD1).dec) + " CD1";
